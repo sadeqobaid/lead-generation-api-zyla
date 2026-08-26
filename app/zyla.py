@@ -155,5 +155,5 @@ def zyla_metadata() -> dict[str, str]:
         "owner": "Sadeq Obaid",
         "data_policy": "provider-dependent; synthetic records are clearly labeled and demo-only",
         "authentication": "Authorization: Bearer <Zyla API key>",
-        "endpoint_method": "POST",
+        "endpoint_method": "GET",
     }

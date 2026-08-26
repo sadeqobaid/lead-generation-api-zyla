@@ -1,0 +1,13 @@
+.env
+*.db
+backups/
+*.dump
+*.sqlite3
+.venv
+__pycache__
+.pytest_cache
+.git
+dist
+docx
+*.zip
+*.sha256

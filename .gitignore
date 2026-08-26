@@ -1,0 +1,12 @@
+.env
+*.db
+*.sqlite
+*.sqlite3
+*.dump
+*.bak
+.venv/
+*pycache*/
+.pytest_cache/
+test*.db
+migration*.db
+zyla*.db

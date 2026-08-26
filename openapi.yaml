@@ -1,0 +1,165 @@
+openapi: 3.0.3
+info:
+  title: Sadeq Obaid Hosted Lead Discovery API
+  version: 0.2.0
+  description: |
+    Marketplace-facing hosted API edition owned by Sadeq Obaid. It provides filtered B2B
+    lead-discovery responses from a deployment-specific provider. Provider rights, accuracy,
+    freshness, permitted use, and any synthetic/demo status remain deployment-dependent.
+  contact:
+    name: Sadeq Obaid
+servers:
+  - url: https://YOUR_PUBLIC_API_DOMAIN
+    description: Replace with the public HTTPS hostname before marketplace submission.
+tags:
+  - name: Marketplace
+    description: Zyla-compatible hosted API contract.
+paths:
+  /health/zyla:
+    get:
+      tags: [Marketplace]
+      security: []
+      summary: Verify hosted marketplace readiness
+      responses:
+        '200':
+          description: Service and database are reachable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, edition, owner, data_policy, authentication, endpoint_method]
+                properties:
+                  status: {type: string, enum: [ok]}
+                  request_id: {type: string}
+                  edition: {type: string, example: zyla-hosted-api}
+                  owner: {type: string, example: Sadeq Obaid}
+                  data_policy: {type: string}
+                  authentication: {type: string}
+                  endpoint_method: {type: string, example: GET}
+        '503':
+          $ref: '#/components/responses/NotReady'
+  /api/v1/zyla/leads/search:
+    get:
+      tags: [Marketplace]
+      summary: Search permitted B2B lead records
+      description: |
+        Returns provider-backed records filtered by the supplied criteria. Do not interpret this
+        contract as a guarantee of real lead data, accuracy, deliverability, enrichment rights,
+        or legal compliance. Each response includes data-status and provenance fields.
+      operationId: zylaLeadSearch
+      security:
+        - bearerAuth: []
+      parameters:
+        - {name: countries, in: query, required: false, schema: {type: string}, description: Comma-separated ISO country codes.}
+        - {name: industries, in: query, required: false, schema: {type: string}, description: Comma-separated industry values.}
+        - {name: job_titles, in: query, required: false, schema: {type: string}, description: Comma-separated job titles.}
+        - {name: technologies, in: query, required: false, schema: {type: string}, description: Comma-separated technology names.}
+        - {name: employee_min, in: query, required: false, schema: {type: integer, minimum: 0}}
+        - {name: employee_max, in: query, required: false, schema: {type: integer, minimum: 0}}
+        - {name: lead_score_min, in: query, required: false, schema: {type: integer, minimum: 0, maximum: 100}}
+        - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 25, default: 10}}
+        - {$ref: '#/components/parameters/IdempotencyKey'}
+      responses:
+        '200':
+          description: Filtered lead records and usage accounting.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LeadSearchResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '422': {$ref: '#/components/responses/InvalidRequest'}
+        '429': {$ref: '#/components/responses/RateLimited'}
+        '503': {$ref: '#/components/responses/NotReady'}
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API key
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: {type: string, minLength: 1, maxLength: 255}
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer credential.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    Forbidden:
+      description: Tenant or usage policy rejected the request.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    Conflict:
+      description: Idempotency key is in progress or was reused with a different request.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    InvalidRequest:
+      description: Request parameters failed validation.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    RateLimited:
+      description: Rate limit exceeded.
+      headers:
+        Retry-After: {schema: {type: integer}}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    NotReady:
+      description: Required hosted dependencies are unavailable.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+  schemas:
+    LeadSearchResponse:
+      type: object
+      required: [request_id, data, pagination, usage]
+      properties:
+        request_id: {type: string}
+        data:
+          type: array
+          items:
+            type: object
+            required: [id, record_status, company, scores, quality, provenance]
+            properties:
+              id: {type: string}
+              record_status: {type: string, example: ACTIVE}
+              company:
+                type: object
+                required: [id, name, data_status]
+                properties:
+                  id: {type: string}
+                  name: {type: string}
+                  website: {type: [string, 'null']}
+                  domain: {type: [string, 'null']}
+                  industry: {type: [string, 'null']}
+                  country: {type: [string, 'null']}
+                  employee_count: {type: [integer, 'null']}
+                  data_status: {type: string, description: Provider-supplied status such as VERIFIED, INFERRED, SYNTHETIC, or UNAVAILABLE.}
+              contact:
+                anyOf:
+                  - {type: object}
+                  - {type: 'null'}
+              scores: {type: object}
+              quality: {type: object}
+              provenance: {type: array, items: {type: object}}
+        pagination: {type: object}
+        usage: {type: object}
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code: {type: string}
+            message: {type: string}
+            request_id: {type: string}
+            details: {type: object}

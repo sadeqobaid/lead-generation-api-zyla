@@ -17,7 +17,7 @@ COPY alembic ./alembic
 COPY alembic.ini ./alembic.ini
 COPY scripts ./scripts
 COPY tests ./tests
-COPY README.md DEPLOYMENT_SETUP.md OPERATIONS.md SECURITY.md ./
+COPY README.docx DEPLOYMENT_SETUP.docx OPERATIONS.docx SECURITY.docx ./
 
 RUN chown -R appuser:appgroup /app && chmod +x /app/scripts/*.sh
 USER appuser

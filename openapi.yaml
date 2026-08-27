@@ -4,49 +4,262 @@ info:
   version: 0.2.0
   description: |
     Marketplace-facing hosted API edition owned by Sadeq Obaid. It provides filtered B2B
-    lead-discovery responses from a deployment-specific provider. Provider rights, accuracy,
-    freshness, permitted use, and any synthetic/demo status remain deployment-dependent.
+    lead-discovery responses from a deployment-specific licensed provider. Provider rights,
+    accuracy, freshness, permitted use, pricing, and any synthetic/demo status remain deployment-
+    dependent and are exposed through the health metadata and provenance fields.
   contact:
     name: Sadeq Obaid
 servers:
   - url: https://YOUR_PUBLIC_API_DOMAIN
     description: Replace with the public HTTPS hostname before marketplace submission.
 tags:
+  - name: Health
+    description: Liveness, readiness, and marketplace verification endpoints.
+  - name: Authentication
+    description: Tenant registration, login, and authenticated user context.
   - name: Marketplace
-    description: Zyla-compatible hosted API contract.
+    description: Zyla-compatible hosted lead-discovery contract.
+  - name: Leads
+    description: Authenticated tenant lead-search operations.
+  - name: API keys
+    description: Tenant API-key lifecycle operations.
+  - name: Privacy
+    description: Tenant-scoped suppression and data-subject request operations.
+  - name: Jobs
+    description: Background job submission and status operations.
+  - name: Billing
+    description: Signed credit-grant webhook operation.
+  - name: Observability
+    description: Metrics endpoint and operational response metadata.
 paths:
-  /health/zyla:
+  /health/live:
     get:
-      tags: [Marketplace]
+      tags: [Health]
       security: []
-      summary: Verify hosted marketplace readiness
+      summary: Check process liveness
+      responses:
+        '200':
+          description: Process is alive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /health/ready:
+    get:
+      tags: [Health]
+      security: []
+      summary: Check database readiness
       responses:
         '200':
           description: Service and database are reachable.
           content:
             application/json:
               schema:
-                type: object
-                required: [status, edition, owner, data_policy, authentication, endpoint_method]
-                properties:
-                  status: {type: string, enum: [ok]}
-                  request_id: {type: string}
-                  edition: {type: string, example: zyla-hosted-api}
-                  owner: {type: string, example: Sadeq Obaid}
-                  data_policy: {type: string}
-                  authentication: {type: string}
-                  endpoint_method: {type: string, example: GET}
+                $ref: '#/components/schemas/HealthResponse'
         '503':
           $ref: '#/components/responses/NotReady'
+  /health/zyla:
+    get:
+      tags: [Health, Marketplace]
+      security: []
+      summary: Verify hosted marketplace readiness
+      responses:
+        '200':
+          description: Service and database are reachable; deployment metadata is returned without credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ZylaHealthResponse'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/NotReady'
+  /metrics:
+    get:
+      tags: [Observability]
+      security: []
+      summary: Expose Prometheus-compatible counters
+      description: |
+        Returns text/plain Prometheus-compatible counters. When METRICS_TOKEN is configured,
+        the caller must send the exact value in the X-Metrics-Token header. The header is optional
+        only when the deployment deliberately leaves metrics unauthenticated.
+      parameters:
+        - $ref: '#/components/parameters/MetricsToken'
+      responses:
+        '200':
+          description: Prometheus-compatible metrics text.
+          content:
+            text/plain:
+              schema:
+                type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/auth/register:
+    post:
+      tags: [Authentication]
+      security: []
+      summary: Register a tenant administrator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Tenant and administrator were created; the access token is returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+  /api/v1/auth/login:
+    post:
+      tags: [Authentication]
+      security: []
+      summary: Authenticate a tenant administrator
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Access token issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+  /api/v1/users/me:
+    get:
+      tags: [Authentication]
+      summary: Return the authenticated user and tenant
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Authenticated user and tenant context.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/api-keys:
+    post:
+      tags: [API keys]
+      summary: Create a tenant API key
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateApiKeyRequest'
+      responses:
+        '201':
+          description: API key created. The secret is returned only in this response.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateApiKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+    get:
+      tags: [API keys]
+      summary: List tenant API keys
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: API keys without their secret values.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ApiKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/api-keys/{key_id}:
+    delete:
+      tags: [API keys]
+      summary: Revoke a tenant API key
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/KeyId'
+      responses:
+        '204':
+          description: API key revoked.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/leads/search:
+    post:
+      tags: [Leads]
+      summary: Search permitted B2B lead records for the authenticated tenant
+      description: |
+        Returns records from the configured provider after filtering, suppression checks, scoring,
+        usage accounting, and tenant credit accounting. Provider licensing and lawful-use review
+        remain deployment responsibilities.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeadSearchRequest'
+      responses:
+        '200':
+          description: Filtered lead records and usage accounting.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeadSearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderUnavailable'
   /api/v1/zyla/leads/search:
     get:
       tags: [Marketplace]
-      summary: Search permitted B2B lead records
+      summary: Search permitted B2B lead records using query parameters
       description: |
-        Returns provider-backed records filtered by the supplied criteria. Do not interpret this
-        contract as a guarantee of real lead data, accuracy, deliverability, enrichment rights,
-        or legal compliance. Each response includes data-status and provenance fields.
-      operationId: zylaLeadSearch
+        Zyla-friendly GET contract using simple query parameters. Each response includes provider,
+        data-status, data-source, use-policy, and observed-at provenance fields.
+      operationId: zylaLeadSearchGet
       security:
         - bearerAuth: []
       parameters:
@@ -58,39 +271,269 @@ paths:
         - {name: employee_max, in: query, required: false, schema: {type: integer, minimum: 0}}
         - {name: lead_score_min, in: query, required: false, schema: {type: integer, minimum: 0, maximum: 100}}
         - {name: limit, in: query, required: false, schema: {type: integer, minimum: 1, maximum: 25, default: 10}}
-        - {$ref: '#/components/parameters/IdempotencyKey'}
+        - $ref: '#/components/parameters/IdempotencyKey'
       responses:
         '200':
           description: Filtered lead records and usage accounting.
           content:
             application/json:
-              schema: {$ref: '#/components/schemas/LeadSearchResponse'}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
-        '409': {$ref: '#/components/responses/Conflict'}
-        '422': {$ref: '#/components/responses/InvalidRequest'}
-        '429': {$ref: '#/components/responses/RateLimited'}
-        '503': {$ref: '#/components/responses/NotReady'}
+              schema:
+                $ref: '#/components/schemas/LeadSearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderUnavailable'
+    post:
+      tags: [Marketplace]
+      summary: Search permitted B2B lead records using a JSON body
+      operationId: zylaLeadSearchPost
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LeadSearchRequest'
+      responses:
+        '200':
+          description: Filtered lead records and usage accounting.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LeadSearchResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '502':
+          $ref: '#/components/responses/ProviderUnavailable'
+  /api/v1/billing/webhook:
+    post:
+      tags: [Billing]
+      security: []
+      summary: Process a signed credit-grant webhook
+      parameters:
+        - $ref: '#/components/parameters/WebhookSignature'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BillingWebhookRequest'
+      responses:
+        '200':
+          description: Webhook processed or recognized as a duplicate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingWebhookResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+        '503':
+          $ref: '#/components/responses/NotReady'
+  /api/v1/privacy/suppressions:
+    post:
+      tags: [Privacy]
+      summary: Create a tenant-scoped suppression entry
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SuppressionRequest'
+      responses:
+        '201':
+          description: Suppression entry recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuppressionResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+  /api/v1/privacy/requests:
+    post:
+      tags: [Privacy]
+      summary: Record a data-subject privacy request
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DataSubjectRequestCreate'
+      responses:
+        '202':
+          description: Privacy request accepted for operator/provider workflow.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DataSubjectRequestResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+    get:
+      tags: [Privacy]
+      summary: List tenant-scoped privacy requests
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Privacy requests without raw subject identifiers.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DataSubjectRequestResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+  /api/v1/jobs/{kind}:
+    post:
+      tags: [Jobs]
+      summary: Submit an allow-listed background job
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          schema:
+            type: string
+            enum: [retention_cleanup, credit_reconciliation]
+      responses:
+        '202':
+          description: Background job accepted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/InvalidRequest'
+        '503':
+          $ref: '#/components/responses/NotReady'
+  /api/v1/jobs/{job_id}:
+    get:
+      tags: [Jobs]
+      summary: Return a tenant-scoped background job
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/JobId'
+      responses:
+        '200':
+          description: Background job metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/usage:
+    get:
+      tags: [Observability]
+      summary: Return tenant usage totals
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Tenant-scoped usage summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UsageSummaryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
-      bearerFormat: API key
+      bearerFormat: JWT or API key
   parameters:
     IdempotencyKey:
       name: Idempotency-Key
       in: header
       required: false
       schema: {type: string, minLength: 1, maxLength: 255}
+      description: Replays a completed request safely and prevents duplicate charging.
+    MetricsToken:
+      name: X-Metrics-Token
+      in: header
+      required: false
+      schema: {type: string, minLength: 1, maxLength: 512}
+      description: Required when METRICS_TOKEN is configured; send the exact shared token.
+    WebhookSignature:
+      name: X-Webhook-Signature
+      in: header
+      required: false
+      schema: {type: string, pattern: '^sha256=[a-f0-9]{64}$'}
+      description: HMAC-SHA256 signature in the form sha256=<hex digest>.
+    KeyId:
+      name: key_id
+      in: path
+      required: true
+      schema: {type: string}
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema: {type: string}
   responses:
     Unauthorized:
-      description: Missing or invalid bearer credential.
+      description: Missing or invalid credential or signature.
       content:
         application/json:
           schema: {$ref: '#/components/schemas/ErrorResponse'}
     Forbidden:
-      description: Tenant or usage policy rejected the request.
+      description: Tenant, scope, credit, or usage policy rejected the request.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
+    NotFound:
+      description: Requested resource or optional feature was not found.
       content:
         application/json:
           schema: {$ref: '#/components/schemas/ErrorResponse'}
@@ -100,7 +543,7 @@ components:
         application/json:
           schema: {$ref: '#/components/schemas/ErrorResponse'}
     InvalidRequest:
-      description: Request parameters failed validation.
+      description: Request parameters or body failed validation.
       content:
         application/json:
           schema: {$ref: '#/components/schemas/ErrorResponse'}
@@ -111,46 +554,256 @@ components:
       content:
         application/json:
           schema: {$ref: '#/components/schemas/ErrorResponse'}
+    ProviderUnavailable:
+      description: The configured external provider failed or returned an invalid response.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/ErrorResponse'}
     NotReady:
       description: Required hosted dependencies are unavailable.
       content:
         application/json:
           schema: {$ref: '#/components/schemas/ErrorResponse'}
   schemas:
+    HealthResponse:
+      type: object
+      required: [status, request_id]
+      properties:
+        status: {type: string, enum: [ok]}
+        request_id: {type: string}
+    ZylaHealthResponse:
+      type: object
+      required: [status, request_id, edition, owner, provider, provider_mode, data_source, data_policy, pricing_model, free_trial_credits, authentication, endpoint_method]
+      properties:
+        status: {type: string, enum: [ok]}
+        request_id: {type: string}
+        edition: {type: string, example: zyla-hosted-api}
+        owner: {type: string, example: Sadeq Obaid}
+        provider: {type: string}
+        provider_mode: {type: string, enum: [synthetic, http]}
+        data_source: {type: string, description: Deployment-specific licensed provider statement.}
+        data_policy: {type: string, description: Permitted-use policy or contract classification.}
+        pricing_model: {type: string, description: Credit and marketplace pricing statement.}
+        free_trial_credits: {type: string, description: Number of free-trial credits configured for the deployment.}
+        authentication: {type: string, example: 'Authorization: Bearer <Zyla API key>'}
+        endpoint_method: {type: string, example: GET or POST}
+    RegisterRequest:
+      type: object
+      required: [tenant_name, email, password]
+      additionalProperties: false
+      properties:
+        tenant_name: {type: string, minLength: 2, maxLength: 200}
+        email: {type: string, format: email, minLength: 3, maxLength: 320}
+        password: {type: string, format: password, minLength: 12, maxLength: 128}
+    LoginRequest:
+      type: object
+      required: [email, password]
+      additionalProperties: false
+      properties:
+        email: {type: string, format: email, minLength: 3, maxLength: 320}
+        password: {type: string, format: password, minLength: 1, maxLength: 128}
+    TokenResponse:
+      type: object
+      required: [access_token, token_type, expires_in]
+      properties:
+        access_token: {type: string}
+        token_type: {type: string, enum: [bearer]}
+        expires_in: {type: integer, description: Token lifetime in seconds.}
+    UserResponse:
+      type: object
+      required: [id, tenant_id, email, role]
+      properties:
+        id: {type: string}
+        tenant_id: {type: string}
+        email: {type: string}
+        role: {type: string}
+    TenantResponse:
+      type: object
+      required: [id, name, slug, status, credits_remaining]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        slug: {type: string}
+        status: {type: string}
+        credits_remaining: {type: integer}
+    MeResponse:
+      type: object
+      required: [user, tenant]
+      properties:
+        user: {$ref: '#/components/schemas/UserResponse'}
+        tenant: {$ref: '#/components/schemas/TenantResponse'}
+    CreateApiKeyRequest:
+      type: object
+      required: [name, scopes]
+      additionalProperties: false
+      properties:
+        name: {type: string, minLength: 1, maxLength: 100}
+        environment: {type: string, enum: [test, production], default: test}
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items: {type: string}
+    ApiKeyResponse:
+      type: object
+      required: [id, name, environment, key_prefix, scopes, status, created_at]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        environment: {type: string}
+        key_prefix: {type: string}
+        scopes: {type: array, items: {type: string}}
+        status: {type: string}
+        created_at: {type: string, format: date-time}
+        last_used_at: {type: string, format: date-time, nullable: true}
+    CreateApiKeyResponse:
+      allOf:
+        - $ref: '#/components/schemas/ApiKeyResponse'
+        - type: object
+          required: [secret]
+          properties:
+            secret: {type: string}
+    EmployeeRange:
+      type: object
+      additionalProperties: false
+      properties:
+        min: {type: integer, minimum: 0, nullable: true}
+        max: {type: integer, minimum: 0, nullable: true}
+    LeadFilters:
+      type: object
+      required: []
+      additionalProperties: false
+      properties:
+        countries: {type: array, maxItems: 20, items: {type: string}}
+        industries: {type: array, maxItems: 20, items: {type: string}}
+        employee_count: {$ref: '#/components/schemas/EmployeeRange'}
+        job_titles: {type: array, maxItems: 50, items: {type: string}}
+        technologies: {type: array, maxItems: 50, items: {type: string}}
+        lead_score_min: {type: integer, minimum: 0, maximum: 100, nullable: true}
+    SortRequest:
+      type: object
+      properties:
+        field: {type: string, enum: [lead_score, company_name, updated_at], default: lead_score}
+        direction: {type: string, enum: [asc, desc], default: desc}
+    LeadSearchRequest:
+      type: object
+      required: [filters]
+      additionalProperties: false
+      properties:
+        filters: {$ref: '#/components/schemas/LeadFilters'}
+        include:
+          type: array
+          maxItems: 5
+          items: {type: string, enum: [company, contact, scores, quality, provenance]}
+        limit: {type: integer, minimum: 1, maximum: 100, default: 50}
+        cursor: {type: string, nullable: true}
+        sort: {$ref: '#/components/schemas/SortRequest'}
+    CompanyResponse:
+      type: object
+      required: [id, name, data_status]
+      properties:
+        id: {type: string}
+        name: {type: string}
+        website: {type: string, nullable: true}
+        domain: {type: string, nullable: true}
+        industry: {type: string, nullable: true}
+        country: {type: string, nullable: true}
+        employee_count: {type: integer, nullable: true}
+        data_status: {type: string}
+    ContactResponse:
+      type: object
+      required: [id, data_status]
+      properties:
+        id: {type: string}
+        first_name: {type: string, nullable: true}
+        last_name: {type: string, nullable: true}
+        job_title: {type: string, nullable: true}
+        email: {type: string, format: email, nullable: true}
+        data_status: {type: string}
+        email_verification: {type: object, nullable: true}
+    LeadResponse:
+      type: object
+      required: [id, record_status, company, scores, quality, provenance]
+      properties:
+        id: {type: string}
+        record_status: {type: string}
+        company: {$ref: '#/components/schemas/CompanyResponse'}
+        contact: {$ref: '#/components/schemas/ContactResponse'}
+        scores: {type: object, additionalProperties: true}
+        quality: {type: object, additionalProperties: true}
+        provenance:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProvenanceResponse'
+    ProvenanceResponse:
+      type: object
+      required: [provider, observed_at, use_policy, data_status]
+      properties:
+        provider: {type: string}
+        observed_at: {type: string, format: date-time}
+        use_policy: {type: string}
+        data_status: {type: string}
+        data_source: {type: string, nullable: true, description: Licensed provider or dataset statement.}
     LeadSearchResponse:
       type: object
       required: [request_id, data, pagination, usage]
       properties:
         request_id: {type: string}
-        data:
-          type: array
-          items:
-            type: object
-            required: [id, record_status, company, scores, quality, provenance]
-            properties:
-              id: {type: string}
-              record_status: {type: string, example: ACTIVE}
-              company:
-                type: object
-                required: [id, name, data_status]
-                properties:
-                  id: {type: string}
-                  name: {type: string}
-                  website: {type: [string, 'null']}
-                  domain: {type: [string, 'null']}
-                  industry: {type: [string, 'null']}
-                  country: {type: [string, 'null']}
-                  employee_count: {type: [integer, 'null']}
-                  data_status: {type: string, description: Provider-supplied status such as VERIFIED, INFERRED, SYNTHETIC, or UNAVAILABLE.}
-              contact:
-                anyOf:
-                  - {type: object}
-                  - {type: 'null'}
-              scores: {type: object}
-              quality: {type: object}
-              provenance: {type: array, items: {type: object}}
-        pagination: {type: object}
-        usage: {type: object}
+        data: {type: array, items: {$ref: '#/components/schemas/LeadResponse'}}
+        pagination: {type: object, additionalProperties: true}
+        usage: {type: object, additionalProperties: true}
+    BillingWebhookRequest:
+      type: object
+      required: [provider, event_id, event_type, tenant_id, credits]
+      additionalProperties: false
+      properties:
+        provider: {type: string, maxLength: 80}
+        event_id: {type: string, maxLength: 200}
+        event_type: {type: string, maxLength: 100}
+        tenant_id: {type: string, maxLength: 36}
+        credits: {type: integer, minimum: 1, maximum: 1000000}
+    BillingWebhookResponse:
+      type: object
+      required: [event_id, status, credits_granted]
+      properties:
+        event_id: {type: string}
+        status: {type: string, enum: [PROCESSED, DUPLICATE]}
+        credits_granted: {type: integer}
+    SuppressionRequest:
+      type: object
+      required: [subject_type, subject, reason]
+      additionalProperties: false
+      properties:
+        subject_type: {type: string, enum: [email, domain, company, contact]}
+        subject: {type: string, minLength: 1, maxLength: 320}
+        reason: {type: string, minLength: 2, maxLength: 255}
+    SuppressionResponse:
+      type: object
+      required: [id, subject_type, created_at]
+      properties:
+        id: {type: string}
+        subject_type: {type: string}
+        created_at: {type: string, format: date-time}
+    DataSubjectRequestCreate:
+      type: object
+      required: [request_type, subject]
+      additionalProperties: false
+      properties:
+        request_type: {type: string, enum: [access, delete, rectify, restrict]}
+        subject: {type: string, minLength: 1, maxLength: 320}
+    DataSubjectRequestResponse:
+      type: object
+      additionalProperties: true
+    JobResponse:
+      type: object
+      additionalProperties: true
+    UsageSummaryResponse:
+      type: object
+      required: [request_id, period, totals]
+      properties:
+        request_id: {type: string}
+        period: {type: object, additionalProperties: {type: string}}
+        totals: {type: object, additionalProperties: {type: integer}}
     ErrorResponse:
       type: object
       required: [error]
@@ -162,4 +815,4 @@ components:
             code: {type: string}
             message: {type: string}
             request_id: {type: string}
-            details: {type: object}
+            details: {type: object, additionalProperties: true}

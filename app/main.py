@@ -10,19 +10,21 @@ from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, Query, Request, Response, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import settings
-from .db import Base, engine, get_db
+from .db import Base, SessionLocal, engine, get_db
 from .errors import AppError
 from .jobs import submit_job
 from .models import ApiKey, BackgroundJob, BillingEvent, CreditLedger, DataSubjectRequest, Search, Suppression, Tenant, UsageRecord, User
 from .privacy import hash_subject
-from .providers import build_provider
+from .providers import ProviderRequestError, build_provider
 from .queue import RedisJobQueue
 from .idempotency import (
     IdempotencyConflict,
@@ -68,7 +70,7 @@ from .security import (
     verify_password,
 )
 from .search_service import execute_lead_search
-from .zyla import authorize_zyla_request, ensure_zyla_tenant, parse_zyla_query, query_to_payload, zyla_metadata
+from .zyla import authorize_zyla_request, ensure_zyla_tenant_id, parse_zyla_query, query_to_payload, zyla_metadata
 
 
 logging.basicConfig(
@@ -105,7 +107,7 @@ app.add_middleware(
     allow_origins=list(settings.cors_origins),
     allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
+    allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id", "X-Metrics-Token", "X-Webhook-Signature"],
 )
 
 provider = build_provider(
@@ -113,6 +115,10 @@ provider = build_provider(
     settings.provider_url,
     settings.provider_token,
     settings.provider_timeout_seconds,
+    settings.provider_name,
+    settings.provider_auth_scheme,
+    settings.provider_data_source,
+    settings.provider_use_policy,
 )
 limiter = (
     RedisRateLimiter(settings.redis_url, settings.rate_limit_per_minute)
@@ -149,12 +155,17 @@ async def request_context(request: Request, call_next):
             extra={"request_id": request_id, "method": request.method, "path": request.url.path},
         )
         raise
+    elapsed_ms = round((time.perf_counter() - started) * 1000)
     response.headers["X-Request-Id"] = request_id
     response.headers["X-API-Version"] = "v1"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["X-Response-Time-Ms"] = str(round((time.perf_counter() - started) * 1000))
+    response.headers["X-Response-Time-Ms"] = str(elapsed_ms)
+    logger.info(
+        "request complete",
+        extra={"request_id": request_id, "method": request.method, "path": request.url.path, "status_code": response.status_code, "latency_ms": elapsed_ms},
+    )
     return response
 
 
@@ -201,6 +212,36 @@ async def validation_error_handler(request: Request, exc: RequestValidationError
     return JSONResponse(
         status_code=422,
         content=error_payload(request, AppError("INVALID_REQUEST", "Request validation failed.", 422, details)),
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_error_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+    code_by_status = {404: "NOT_FOUND", 405: "METHOD_NOT_ALLOWED"}
+    code = code_by_status.get(exc.status_code, f"HTTP_{exc.status_code}")
+    message = exc.detail if isinstance(exc.detail, str) else "HTTP request failed."
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=error_payload(request, AppError(code, message, exc.status_code)),
+        headers={"WWW-Authenticate": "Bearer"} if exc.status_code == 401 else None,
+    )
+
+
+@app.exception_handler(ProviderRequestError)
+async def provider_error_handler(request: Request, exc: ProviderRequestError) -> JSONResponse:
+    logger.warning("provider request failed", extra={"request_id": current_request_id(request)})
+    return JSONResponse(
+        status_code=502,
+        content=error_payload(request, AppError("PROVIDER_UNAVAILABLE", "The configured data provider is unavailable.", 502)),
+    )
+
+
+@app.exception_handler(Exception)
+async def unexpected_error_handler(request: Request, exc: Exception) -> JSONResponse:
+    logger.exception("unhandled application error", extra={"request_id": current_request_id(request)})
+    return JSONResponse(
+        status_code=500,
+        content=error_payload(request, AppError("INTERNAL_ERROR", "An unexpected server error occurred.", 500)),
     )
 
 
@@ -265,15 +306,16 @@ def register(request: Request, payload: RegisterRequest, db: Session = Depends(g
     slug = re.sub(r"[^a-z0-9]+", "-", payload.tenant_name.lower()).strip("-") or "tenant"
     if db.scalar(select(Tenant).where(Tenant.slug == slug)) is not None:
         slug = f"{slug}-{uuid4().hex[:8]}"
-    tenant = Tenant(name=payload.tenant_name, slug=slug, credits_balance=settings.default_credits)
+    registration_credits = settings.free_trial_credits or settings.default_credits
+    tenant = Tenant(name=payload.tenant_name, slug=slug, credits_balance=registration_credits)
     user = User(tenant=tenant, email=payload.email, password_hash=hash_password(payload.password), role="TENANT_ADMIN")
     db.add_all([tenant, user])
     db.flush()
     db.add(
         CreditLedger(
             tenant_id=tenant.id,
-            amount=settings.default_credits,
-            reason="registration_grant",
+            amount=registration_credits,
+            reason="registration_free_trial" if settings.free_trial_credits else "registration_grant",
             reference_id=f"registration:{tenant.id}",
             metadata_json={"email": user.email},
         )
@@ -371,7 +413,6 @@ async def search_leads(
     payload: LeadSearchRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
     context: AuthContext = Depends(get_auth_context),
-    db: Session = Depends(get_db),
 ) -> LeadSearchResponse:
     """Search approved provider data with replay-safe billing and tenant isolation."""
     require_scope(context, "leads:read")
@@ -402,7 +443,6 @@ async def search_leads(
 
     try:
         response = await execute_lead_search(
-            db=db,
             tenant_id=context.tenant_id,
             api_key_id=context.api_key_id,
             request_id=request_id,
@@ -420,7 +460,6 @@ async def search_leads(
         if idempotency_scope:
             await idempotency_store.delete(idempotency_scope)
             logger.exception("lead search failed", extra={"request_id": request_id, "tenant_id": context.tenant_id})
-        db.rollback()
         raise
 
 
@@ -428,19 +467,18 @@ async def _execute_zyla_search(
     request: Request,
     payload: LeadSearchRequest,
     idempotency_key: str | None,
-    db: Session,
 ) -> LeadSearchResponse:
     """Run one marketplace request against a dedicated accounting tenant."""
     authorize_zyla_request(request)
-    tenant = ensure_zyla_tenant(db)
+    tenant_id = await run_in_threadpool(ensure_zyla_tenant_id)
     try:
-        await limiter.check(f"zyla:{tenant.id}")
+        await limiter.check(f"zyla:{tenant_id}")
     except RateLimitExceeded as exc:
         raise AppError("RATE_LIMITED", "Rate limit exceeded.", 429, {"retry_after": exc.retry_after}) from exc
 
     request_id = current_request_id(request)
     request_fingerprint = hashlib.sha256(payload.model_dump_json().encode()).hexdigest()
-    idempotency_scope = f"zyla:{tenant.id}:{idempotency_key}" if idempotency_key else None
+    idempotency_scope = f"zyla:{tenant_id}:{idempotency_key}" if idempotency_key else None
     if idempotency_scope:
         try:
             cached = await idempotency_store.get(idempotency_scope, request_fingerprint)
@@ -459,8 +497,7 @@ async def _execute_zyla_search(
 
     try:
         response = await execute_lead_search(
-            db=db,
-            tenant_id=tenant.id,
+            tenant_id=tenant_id,
             api_key_id=None,
             request_id=request_id,
             request_fingerprint=request_fingerprint,
@@ -476,8 +513,7 @@ async def _execute_zyla_search(
     except Exception:
         if idempotency_scope:
             await idempotency_store.delete(idempotency_scope)
-        db.rollback()
-        logger.exception("Zyla marketplace search failed", extra={"request_id": request_id, "tenant_id": tenant.id})
+        logger.exception("Zyla marketplace search failed", extra={"request_id": request_id, "tenant_id": tenant_id})
         raise
 
 
@@ -493,7 +529,6 @@ async def zyla_search_get(
     lead_score_min: int | None = Query(default=None, ge=0, le=100),
     limit: int = Query(default=10, ge=1, le=100),
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    db: Session = Depends(get_db),
 ) -> LeadSearchResponse:
     """Zyla-friendly GET contract using simple query parameters and bearer authentication."""
     query = parse_zyla_query(
@@ -506,7 +541,7 @@ async def zyla_search_get(
         lead_score_min=lead_score_min,
         limit=limit,
     )
-    return await _execute_zyla_search(request, query_to_payload(query), idempotency_key, db)
+    return await _execute_zyla_search(request, query_to_payload(query), idempotency_key)
 
 
 @app.post("/api/v1/zyla/leads/search", response_model=LeadSearchResponse)
@@ -514,19 +549,55 @@ async def zyla_search_post(
     request: Request,
     payload: LeadSearchRequest,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    db: Session = Depends(get_db),
 ) -> LeadSearchResponse:
     """JSON variant for Zyla configurations that support POST request bodies."""
     if payload.limit > settings.zyla_max_limit:
         raise AppError("INVALID_REQUEST", f"limit must be at most {settings.zyla_max_limit}.", 422)
-    return await _execute_zyla_search(request, payload, idempotency_key, db)
+    return await _execute_zyla_search(request, payload, idempotency_key)
+
+
+def _apply_billing_event(
+    provider_name: str,
+    event_id: str,
+    event_type: str,
+    tenant_id: str,
+    credits: int,
+) -> BillingWebhookResponse:
+    """Apply a verified billing event in an isolated synchronous transaction."""
+    with SessionLocal() as db:
+        existing = db.scalar(select(BillingEvent).where(BillingEvent.provider == provider_name, BillingEvent.event_id == event_id))
+        if existing is not None:
+            return BillingWebhookResponse(event_id=event_id, status="DUPLICATE", credits_granted=existing.credits_granted)
+        tenant = db.scalar(select(Tenant).where(Tenant.id == tenant_id).with_for_update())
+        if tenant is None or tenant.status != "ACTIVE":
+            raise AppError("TENANT_NOT_FOUND", "Tenant was not found or is inactive.", 404)
+        db.add(
+            BillingEvent(
+                provider=provider_name,
+                event_id=event_id,
+                tenant_id=tenant_id,
+                event_type=event_type,
+                credits_granted=credits,
+            )
+        )
+        tenant.credits_balance += credits
+        db.add(
+            CreditLedger(
+                tenant_id=tenant_id,
+                amount=credits,
+                reason="billing_grant",
+                reference_id=f"billing:{provider_name}:{event_id}",
+                metadata_json={"event_type": event_type},
+            )
+        )
+        db.commit()
+        return BillingWebhookResponse(event_id=event_id, status="PROCESSED", credits_granted=credits)
 
 
 @app.post("/api/v1/billing/webhook", response_model=BillingWebhookResponse)
 async def billing_webhook(
     request: Request,
     signature: str | None = Header(default=None, alias="X-Webhook-Signature"),
-    db: Session = Depends(get_db),
 ) -> BillingWebhookResponse:
     """Verify a generic HMAC webhook and grant credits once per provider event.
 
@@ -557,33 +628,7 @@ async def billing_webhook(
         raise AppError("INVALID_WEBHOOK", "credits must be an integer.", 422) from exc
     if not event_id or not event_type or not tenant_id or credits <= 0 or credits > 1_000_000:
         raise AppError("INVALID_WEBHOOK", "Webhook event fields are invalid.", 422)
-    existing = db.scalar(select(BillingEvent).where(BillingEvent.provider == provider_name, BillingEvent.event_id == event_id))
-    if existing is not None:
-        return BillingWebhookResponse(event_id=event_id, status="DUPLICATE", credits_granted=existing.credits_granted)
-    tenant = db.scalar(select(Tenant).where(Tenant.id == tenant_id).with_for_update())
-    if tenant is None or tenant.status != "ACTIVE":
-        raise AppError("TENANT_NOT_FOUND", "Tenant was not found or is inactive.", 404)
-    db.add(
-        BillingEvent(
-            provider=provider_name,
-            event_id=event_id,
-            tenant_id=tenant_id,
-            event_type=event_type,
-            credits_granted=credits,
-        )
-    )
-    tenant.credits_balance += credits
-    db.add(
-        CreditLedger(
-            tenant_id=tenant_id,
-            amount=credits,
-            reason="billing_grant",
-            reference_id=f"billing:{provider_name}:{event_id}",
-            metadata_json={"event_type": event_type},
-        )
-    )
-    db.commit()
-    return BillingWebhookResponse(event_id=event_id, status="PROCESSED", credits_granted=credits)
+    return await run_in_threadpool(_apply_billing_event, provider_name, event_id, event_type, tenant_id, credits)
 
 
 @app.post("/api/v1/privacy/suppressions", response_model=SuppressionResponse, status_code=status.HTTP_201_CREATED)
@@ -653,14 +698,13 @@ def list_privacy_requests(
 async def create_job(
     kind: str,
     context: AuthContext = Depends(get_auth_context),
-    db: Session = Depends(get_db),
 ) -> JobResponse:
     """Submit an allow-listed operational job to Redis Streams."""
     require_scope(context, "jobs:write")
     if kind not in {"retention_cleanup", "credit_reconciliation"}:
         raise AppError("INVALID_JOB", "Unsupported job kind.", 422)
     try:
-        job = await submit_job(db, job_queue, kind, context.tenant_id, {})
+        job = await submit_job(job_queue, kind, context.tenant_id, {})
     except Exception as exc:
         raise AppError("QUEUE_UNAVAILABLE", "The background queue is unavailable.", 503) from exc
     return JobResponse.model_validate(job, from_attributes=True)

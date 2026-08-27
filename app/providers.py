@@ -109,34 +109,60 @@ class SyntheticLeadProvider:
 
 
 class HttpLeadProvider:
-    """Generic POST/JSON adapter for a buyer-approved provider contract.
+    """Configurable POST/JSON adapter for a licensed buyer-approved provider.
 
-    Expected response shape is either a list of records or ``{"data": [...]}``. Each record
-    must contain a ``company`` object and may contain ``contact``, ``observed_at``, ``use_policy``,
-    and ``data_status``. Field mapping, provider licensing, and lawful-use review remain
-    deployment-specific and must be documented by the buyer.
+    The adapter deliberately uses a small stable contract instead of pretending to implement a
+    vendor-specific API without that vendor's agreement. The configured provider receives
+    ``{"filters": {...}}`` and must return either a list of records, ``{"data": [...]}``, or
+    ``{"results": [...]}``. Each record must contain a ``company`` object with a non-empty
+    ``name``. The deployment supplies the vendor name, credential scheme, data-source statement,
+    and permitted-use policy so marketplace responses include provenance rather than opaque
+    synthetic labels.
     """
 
-    code = "http_provider"
-
-    def __init__(self, url: str, token: str, timeout_seconds: float = 15.0) -> None:
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        provider_name: str,
+        auth_scheme: str = "bearer",
+        timeout_seconds: float = 15.0,
+        data_source: str = "",
+        use_policy: str = "PROVIDER_CONTRACT_REQUIRED",
+        transport: httpx.AsyncBaseTransport | None = None,
+    ) -> None:
         self.url = url
         self.token = token
+        self.provider_name = provider_name
+        self.auth_scheme = auth_scheme
         self.timeout_seconds = timeout_seconds
+        self.data_source = data_source
+        self.use_policy = use_policy
+        self.transport = transport
+        self.code = provider_name
+
+    def _headers(self) -> dict[str, str]:
+        credential_header = "X-API-Key" if self.auth_scheme == "x-api-key" else "Authorization"
+        credential_value = self.token if self.auth_scheme == "x-api-key" else f"Bearer {self.token}"
+        return {
+            credential_header: credential_value,
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "lead-generation-api/0.2.0",
+        }
 
     async def search(self, filters: dict[str, Any]) -> list[ProviderLead]:
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
-                response = await client.post(
-                    self.url,
-                    json={"filters": filters},
-                    headers={"Authorization": f"Bearer {self.token}", "Accept": "application/json"},
-                )
+            async with httpx.AsyncClient(timeout=self.timeout_seconds, transport=self.transport) as client:
+                response = await client.post(self.url, json={"filters": filters}, headers=self._headers())
                 response.raise_for_status()
                 payload = response.json()
         except (httpx.HTTPError, ValueError) as exc:
             raise ProviderRequestError("configured provider request failed") from exc
-        records = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(payload, dict):
+            records = payload.get("data", payload.get("results"))
+        else:
+            records = payload
         if not isinstance(records, list):
             raise ProviderRequestError("configured provider returned an invalid JSON shape")
         now = datetime.now(timezone.utc).isoformat()
@@ -144,25 +170,41 @@ class HttpLeadProvider:
         for record in records:
             if not isinstance(record, dict) or not isinstance(record.get("company"), dict):
                 raise ProviderRequestError("configured provider returned a record without a company object")
+            company = record["company"]
+            if not isinstance(company.get("name"), str) or not company["name"].strip():
+                raise ProviderRequestError("configured provider returned a company without a name")
+            provider_data_status = str(record.get("data_status") or company.get("data_status") or "PROVIDER_SUPPLIED")
+            if provider_data_status.upper() == "SYNTHETIC":
+                raise ProviderRequestError("configured provider returned a synthetic record")
+            provenance = str(record.get("data_source") or self.data_source or self.provider_name)
             result.append(
                 ProviderLead(
-                    provider=self.code,
-                    company=record["company"],
+                    provider=self.provider_name,
+                    company={**company, "data_source": provenance},
                     contact=record.get("contact") if isinstance(record.get("contact"), dict) else None,
                     observed_at=str(record.get("observed_at") or now),
-                    use_policy=str(record.get("use_policy") or "PROVIDER_CONTRACT_REQUIRED"),
-                    data_status=str(record.get("data_status") or "PROVIDER_SUPPLIED"),
+                    use_policy=str(record.get("use_policy") or self.use_policy),
+                    data_status=provider_data_status,
                 )
             )
         return result
 
 
-def build_provider(mode: str, url: str = "", token: str = "", timeout_seconds: float = 15.0) -> LeadProvider:
+def build_provider(
+    mode: str,
+    url: str = "",
+    token: str = "",
+    timeout_seconds: float = 15.0,
+    provider_name: str = "approved_http_provider",
+    auth_scheme: str = "bearer",
+    data_source: str = "",
+    use_policy: str = "PROVIDER_CONTRACT_REQUIRED",
+) -> LeadProvider:
     """Build only an explicitly selected provider and fail closed for unsupported modes."""
     if mode == "synthetic":
         return SyntheticLeadProvider()
-    if mode == "http" and url and token:
-        return HttpLeadProvider(url, token, timeout_seconds)
+    if mode == "http" and url and token and provider_name:
+        return HttpLeadProvider(url, token, provider_name, auth_scheme, timeout_seconds, data_source, use_policy)
     raise ProviderConfigurationError(
         f"provider mode {mode!r} has no complete included adapter configuration; "
         "configure an approved licensed HTTP provider or install a deployment-specific adapter"

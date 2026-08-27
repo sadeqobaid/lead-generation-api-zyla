@@ -28,10 +28,20 @@ def main() -> int:
         health_body = health.json()
         assert health_body["status"] == "ok"
         assert health_body["owner"] == "Sadeq Obaid"
+        assert health_body["data_source"]
+        assert health_body["pricing_model"]
 
         openapi = client.get("/openapi.json")
         assert openapi.status_code == 200, openapi.text
-        assert "/api/v1/zyla/leads/search" in openapi.json()["paths"]
+        openapi_body = openapi.json()
+        assert "/api/v1/auth/register" in openapi_body["paths"]
+        assert "/api/v1/auth/login" in openapi_body["paths"]
+        assert "/api/v1/users/me" in openapi_body["paths"]
+        assert "/api/v1/zyla/leads/search" in openapi_body["paths"]
+        assert any(
+            parameter.get("name") == "X-Metrics-Token"
+            for parameter in openapi_body["paths"]["/metrics"]["get"]["parameters"]
+        )
 
         unauthorized = client.get("/api/v1/zyla/leads/search", params={"limit": 1})
         assert unauthorized.status_code == 401, unauthorized.text
@@ -47,6 +57,7 @@ def main() -> int:
         assert body["data"]
         assert body["data"][0]["company"]["country"] == "SA"
         assert "provenance" in body["data"][0]
+        assert body["data"][0]["provenance"][0]["data_source"]
 
         replay = client.get(
             "/api/v1/zyla/leads/search",

@@ -21,12 +21,17 @@ class Settings:
 
     Development defaults are intentionally convenient for local SQLite testing. A production
     process must provide strong secrets, PostgreSQL, Redis coordination, and a non-synthetic
-    provider before it can start.
+    provider before it can start. The real-provider adapter is contract-driven: deployments
+    supply the licensed vendor endpoint, credential, and data-policy statement.
     """
 
     app_name: str = os.getenv("APP_NAME", "Lead Generation API")
     environment: str = os.getenv("APP_ENV", "development").strip().lower()
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///./lead_generation.db")
+    db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "20"))
+    db_max_overflow: int = int(os.getenv("DB_MAX_OVERFLOW", "40"))
+    db_pool_recycle_seconds: int = int(os.getenv("DB_POOL_RECYCLE_SECONDS", "3600"))
+    db_pool_timeout_seconds: int = int(os.getenv("DB_POOL_TIMEOUT_SECONDS", "30"))
     jwt_secret: str = os.getenv("JWT_SECRET", "dev-only-change-me")
     jwt_algorithm: str = os.getenv("JWT_ALGORITHM", "HS256")
     access_token_minutes: int = int(os.getenv("ACCESS_TOKEN_MINUTES", "30"))
@@ -45,9 +50,18 @@ class Settings:
     queue_consumer: str = os.getenv("QUEUE_CONSUMER", os.getenv("HOSTNAME", "worker"))
     queue_block_ms: int = int(os.getenv("QUEUE_BLOCK_MS", "5000"))
     provider_mode: str = os.getenv("PROVIDER_MODE", "synthetic").strip().lower()
+    provider_name: str = os.getenv("PROVIDER_NAME", "approved_http_provider").strip()
     provider_url: str = os.getenv("PROVIDER_URL", "")
     provider_token: str = os.getenv("PROVIDER_TOKEN", "")
+    provider_auth_scheme: str = os.getenv("PROVIDER_AUTH_SCHEME", "bearer").strip().lower()
     provider_timeout_seconds: float = float(os.getenv("PROVIDER_TIMEOUT_SECONDS", "15"))
+    provider_data_source: str = os.getenv(
+        "PROVIDER_DATA_SOURCE",
+        "Deployment-specific licensed B2B data provider; configure before marketplace launch.",
+    ).strip()
+    provider_use_policy: str = os.getenv("PROVIDER_USE_POLICY", "PROVIDER_CONTRACT_REQUIRED").strip()
+    pricing_model: str = os.getenv("PRICING_MODEL", "One credit per returned lead; marketplace price is deployment-defined.").strip()
+    free_trial_credits: int = int(os.getenv("FREE_TRIAL_CREDITS", "0"))
     billing_webhook_secret: str = os.getenv("BILLING_WEBHOOK_SECRET", "")
     allow_synthetic_in_production: bool = _bool("ALLOW_SYNTHETIC_IN_PRODUCTION", False)
     metrics_enabled: bool = _bool("METRICS_ENABLED", True)
@@ -72,6 +86,18 @@ class Settings:
             raise ValueError("DEFAULT_CREDITS and RATE_LIMIT_PER_MINUTE are invalid")
         if self.idempotency_ttl_seconds < 60:
             raise ValueError("IDEMPOTENCY_TTL_SECONDS must be at least 60")
+        if self.db_pool_size <= 0 or self.db_max_overflow < 0 or self.db_pool_recycle_seconds <= 0 or self.db_pool_timeout_seconds <= 0:
+            raise ValueError("database pool settings are invalid")
+        if self.provider_mode not in {"synthetic", "http"}:
+            raise ValueError("PROVIDER_MODE must be synthetic or http")
+        if self.provider_timeout_seconds <= 0:
+            raise ValueError("PROVIDER_TIMEOUT_SECONDS must be positive")
+        if self.provider_auth_scheme not in {"bearer", "x-api-key"}:
+            raise ValueError("PROVIDER_AUTH_SCHEME must be bearer or x-api-key")
+        if self.free_trial_credits < 0:
+            raise ValueError("FREE_TRIAL_CREDITS must be non-negative")
+        if self.provider_mode == "http" and (not self.provider_url or not self.provider_token or not self.provider_name):
+            raise ValueError("http provider mode requires PROVIDER_URL, PROVIDER_TOKEN, and PROVIDER_NAME")
         if self.zyla_enabled:
             if self.zyla_auth_mode not in {"shared_token", "public"}:
                 raise ValueError("ZYLA_AUTH_MODE must be shared_token or public")
@@ -108,8 +134,8 @@ class Settings:
                 raise ValueError("production metrics require METRICS_TOKEN with at least 32 characters")
             if self.provider_mode == "synthetic" and not self.allow_synthetic_in_production:
                 raise ValueError("production requires an approved non-synthetic provider")
-            if self.provider_mode == "http" and (not self.provider_url or not self.provider_token):
-                raise ValueError("http provider mode requires PROVIDER_URL and PROVIDER_TOKEN")
+            if self.provider_mode == "http" and (not self.provider_url or not self.provider_token or not self.provider_data_source):
+                raise ValueError("http provider mode requires PROVIDER_URL, PROVIDER_TOKEN, and PROVIDER_DATA_SOURCE")
             if len(self.billing_webhook_secret) < 32:
                 raise ValueError("production requires BILLING_WEBHOOK_SECRET with at least 32 characters")
 

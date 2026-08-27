@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .config import settings
+from .db import SessionLocal
 from .errors import AppError
 from .models import CreditLedger, Tenant
 from .security import constant_time_equal
@@ -82,6 +83,12 @@ def ensure_zyla_tenant(db: Session) -> Tenant:
     return tenant
 
 
+def ensure_zyla_tenant_id() -> str:
+    """Provision or validate the marketplace accounting tenant off the async event loop."""
+    with SessionLocal() as db:
+        return ensure_zyla_tenant(db).id
+
+
 def _csv_values(values: str | None, *, field: str, maximum: int) -> list[str]:
     if not values:
         return []
@@ -150,10 +157,20 @@ def query_to_payload(query: ZylaQuery):
 
 def zyla_metadata() -> dict[str, str]:
     """Metadata used by the listing and health checks; it contains no credentials."""
+    synthetic = settings.provider_mode == "synthetic"
     return {
         "edition": "zyla-hosted-api",
         "owner": "Sadeq Obaid",
-        "data_policy": "provider-dependent; synthetic records are clearly labeled and demo-only",
+        "provider": settings.provider_name if not synthetic else "synthetic_provider",
+        "provider_mode": settings.provider_mode,
+        "data_source": (
+            "Built-in deterministic fixture records; development and demonstrations only."
+            if synthetic
+            else settings.provider_data_source
+        ),
+        "data_policy": "SYNTHETIC_DEMO_ONLY" if synthetic else settings.provider_use_policy,
+        "pricing_model": settings.pricing_model,
+        "free_trial_credits": str(settings.free_trial_credits),
         "authentication": "Authorization: Bearer <Zyla API key>",
-        "endpoint_method": "GET",
+        "endpoint_method": "GET or POST",
     }

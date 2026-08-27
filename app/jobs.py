@@ -3,10 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from .config import settings
+from .db import SessionLocal
 from .models import BackgroundJob, CreditLedger, IdempotencyRecord, Search, UsageRecord
 from .queue import RedisJobQueue
 
@@ -15,18 +17,31 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-async def submit_job(db: Session, queue: RedisJobQueue, kind: str, tenant_id: str | None, payload: dict[str, Any]) -> BackgroundJob:
-    """Persist a job before enqueueing it; the dispatcher can recover enqueue failures."""
-    job = BackgroundJob(tenant_id=tenant_id, kind=kind, payload=payload, status="QUEUED")
-    db.add(job)
-    db.commit()
-    db.refresh(job)
+def _create_job_record(kind: str, tenant_id: str | None, payload: dict[str, Any]) -> BackgroundJob:
+    with SessionLocal() as db:
+        job = BackgroundJob(tenant_id=tenant_id, kind=kind, payload=payload, status="QUEUED")
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
+
+
+def _mark_job_failed(job_id: str, error_type: str) -> None:
+    with SessionLocal() as db:
+        job = db.get(BackgroundJob, job_id)
+        if job is not None:
+            job.status = "FAILED"
+            job.last_error = f"queue submission failed: {error_type}"
+            db.commit()
+
+
+async def submit_job(queue: RedisJobQueue, kind: str, tenant_id: str | None, payload: dict[str, Any]) -> BackgroundJob:
+    """Persist a job before enqueueing it without blocking the async request loop."""
+    job = await run_in_threadpool(_create_job_record, kind, tenant_id, payload)
     try:
         await queue.enqueue(job.id, job.kind)
     except Exception as exc:
-        job.status = "FAILED"
-        job.last_error = f"queue submission failed: {type(exc).__name__}"
-        db.commit()
+        await run_in_threadpool(_mark_job_failed, job.id, type(exc).__name__)
         raise
     return job
 

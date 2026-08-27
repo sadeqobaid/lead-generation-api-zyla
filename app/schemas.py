@@ -176,6 +176,7 @@ class ProvenanceResponse(BaseModel):
     observed_at: datetime
     use_policy: str
     data_status: str
+    data_source: str | None = None
 
 
 class LeadResponse(BaseModel):
